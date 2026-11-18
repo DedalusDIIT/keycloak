@@ -32,7 +32,6 @@ import org.keycloak.authorization.identity.Identity;
 import org.keycloak.authorization.store.ResourceServerStore;
 import org.keycloak.authorization.store.StoreFactory;
 import org.keycloak.authorization.util.Tokens;
-import org.keycloak.models.AdminRoles;
 import org.keycloak.models.AuthenticatedClientSessionModel;
 import org.keycloak.models.ClientModel;
 import org.keycloak.models.ClientSessionContext;
@@ -176,6 +175,9 @@ public class KeycloakIdentity implements Identity {
         }
 
         UserModel user = getUserFromToken();
+        if (user == null) {
+            throw new IllegalArgumentException("User from token not found");
+        }
 
         addRolesAsAttributes(this.accessToken, realm, user, attributes);
 
@@ -195,6 +197,19 @@ public class KeycloakIdentity implements Identity {
     }
 
     public KeycloakIdentity(AccessToken accessToken, KeycloakSession keycloakSession, RealmModel realm, boolean ignoreTokenRoles) {
+        this(accessToken, keycloakSession, realm, ignoreTokenRoles, null);
+    }
+
+    /**
+     * Creates an identity for the given {@code user}, avoiding a lookup of the user from the token.
+     *
+     * @param accessToken the token
+     * @param keycloakSession the session
+     * @param realm the realm the user belongs to
+     * @param ignoreTokenRoles if roles should be resolved from the user rather than from the token
+     * @param tokenUser the user the token was issued to, or {@code null} to resolve the user from the token
+     */
+    public KeycloakIdentity(AccessToken accessToken, KeycloakSession keycloakSession, RealmModel realm, boolean ignoreTokenRoles, UserModel tokenUser) {
         if (accessToken == null) {
             throw new ErrorResponseException("invalid_bearer_token", "Could not obtain bearer access_token from request.", Status.FORBIDDEN);
         }
@@ -249,7 +264,7 @@ public class KeycloakIdentity implements Identity {
                 clientUser = this.keycloakSession.users().getServiceAccount(clientModel);
             }
 
-            UserModel user = getUserFromToken();
+            UserModel user = tokenUser != null ? tokenUser : getUserFromToken();
             if (user == null) {
                 throw new IllegalArgumentException("User from token not found");
             }
@@ -305,7 +320,7 @@ public class KeycloakIdentity implements Identity {
 
         boolean hasRole = user.hasRole(role);
 
-        if (AdminRoles.isAdminRole(role) && !hasRole) {
+        if (!hasRole) {
             return false;
         }
 
@@ -353,7 +368,7 @@ public class KeycloakIdentity implements Identity {
 
         boolean hasRole = user.hasRole(role);
 
-        if (AdminRoles.isAdminRole(role) && !hasRole) {
+        if (!hasRole) {
             return false;
         }
 

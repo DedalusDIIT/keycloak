@@ -18,6 +18,7 @@
 package org.keycloak.storage.ldap.idm.store.ldap;
 
 import java.io.IOException;
+import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
@@ -25,6 +26,7 @@ import java.util.Hashtable;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.naming.AuthenticationException;
 import javax.naming.Binding;
 import javax.naming.Context;
@@ -45,6 +47,7 @@ import javax.naming.ldap.LdapName;
 import javax.naming.ldap.PagedResultsControl;
 import javax.naming.ldap.PagedResultsResponseControl;
 import javax.naming.ldap.StartTlsResponse;
+import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 
 import org.keycloak.common.util.Time;
@@ -416,6 +419,10 @@ public class LDAPOperationManager {
     }
 
     public Condition getFilterById(String id) {
+        return getFilterById(id, true);
+    }
+
+    public Condition getFilterById(String id, boolean applyCustomUserFilter) {
         LDAPQueryConditionsBuilder builder = new LDAPQueryConditionsBuilder();
         Condition conditionId;
 
@@ -429,7 +436,7 @@ public class LDAPOperationManager {
             conditionId = builder.equal(getUuidAttributeName(), id);
         }
 
-        if (config.getCustomUserSearchFilter() != null) {
+        if (applyCustomUserFilter && config.getCustomUserSearchFilter() != null) {
             return builder.andCondition(new Condition[]{conditionId, builder.addCustomLDAPFilter(config.getCustomUserSearchFilter())});
         } else {
             return conditionId;
@@ -437,7 +444,11 @@ public class LDAPOperationManager {
     }
 
     public SearchResult lookupById(final LdapName baseDN, final String id, final Collection<String> returningAttributes) {
-        final String filter = getFilterById(id).toFilter();
+        return lookupById(baseDN, id, returningAttributes, true);
+    }
+
+    public SearchResult lookupById(final LdapName baseDN, final String id, final Collection<String> returningAttributes, final boolean applyCustomUserFilter) {
+        final String filter = getFilterById(id, applyCustomUserFilter).toFilter();
 
         try {
             final SearchControls cons = getSearchControls(returningAttributes, this.config.getSearchScope());
@@ -533,6 +544,8 @@ public class LDAPOperationManager {
 
         LdapContext authCtx = null;
         StartTlsResponse tlsResponse = null;
+        AtomicReference<SSLSocket> tlsSocket = new AtomicReference<>();
+        AtomicReference<Socket> tlsTransport = new AtomicReference<>();
 
         var tracing = session.getProvider(TracingProvider.class);
         tracing.startSpan(LDAPOperationManager.class, "authenticate");
@@ -550,33 +563,43 @@ public class LDAPOperationManager {
             // Prepare to receive password policy response control.
             env.put(LdapContext.CONTROL_FACTORIES, PasswordPolicyControlFactory.class.getName());
 
-            // Create connection but avoid triggering automatic bind request by not setting security principal and credentials yet.
-            // That allows us to send optional StartTLS request before binding.
-            authCtx = new InitialLdapContext(env, null);
-
-            // Send StartTLS request and setup SSL context if needed.
             if (config.isStartTls()) {
+                // Create connection but avoid triggering automatic bind request by not setting security principal and credentials yet.
+                // That allows us to send StartTLS request before binding.
+                // Note: failover between multiple connection URLs only happens during context creation, so a bind failure
+                // after StartTLS will not fail over to the next URL.
+                authCtx = new InitialLdapContext(env, null);
+
                 SSLSocketFactory sslSocketFactory = null;
                 if (LDAPUtil.shouldUseTruststoreSpi(config)) {
                     TruststoreProvider provider = session.getProvider(TruststoreProvider.class);
                     sslSocketFactory = provider.getSSLSocketFactory();
                 }
 
-                tlsResponse = LDAPContextManager.startTLS(authCtx, sslSocketFactory);
+                tlsResponse = LDAPContextManager.startTLS(authCtx, sslSocketFactory, tlsSocket, tlsTransport);
 
                 // Exception should be already thrown by LDAPContextManager.startTLS if "startTLS" could not be established, but rather do some additional check
                 if (tlsResponse == null) {
                     throw new AuthenticationException("Null TLS Response returned from the authentication");
                 }
+
+                // Configure given credentials.
+                authCtx.addToEnvironment(Context.SECURITY_AUTHENTICATION, "simple");
+                authCtx.addToEnvironment(Context.SECURITY_PRINCIPAL, dn.toString());
+                authCtx.addToEnvironment(Context.SECURITY_CREDENTIALS, password);
+
+                // Send bind request. Throws AuthenticationException when authentication fails.
+                authCtx.reconnect(getControls());
+            } else {
+                // Bind during context creation so that JNDI can fail over to the next URL of a multi-URL connection URL
+                // when a server accepts the connection but fails to answer the bind (e.g. read timeout). Failover is
+                // only performed during context creation, not by reconnect(). Request controls are sent with the bind
+                // and response controls (e.g. password policy) are available via getResponseControls().
+                env.put(Context.SECURITY_AUTHENTICATION, "simple");
+                env.put(Context.SECURITY_PRINCIPAL, dn.toString());
+                env.put(Context.SECURITY_CREDENTIALS, password);
+                authCtx = new InitialLdapContext(env, getControls());
             }
-
-            // Configure given credentials.
-            authCtx.addToEnvironment(Context.SECURITY_AUTHENTICATION, "simple");
-            authCtx.addToEnvironment(Context.SECURITY_PRINCIPAL, dn.toString());
-            authCtx.addToEnvironment(Context.SECURITY_CREDENTIALS, password);
-
-            // Send bind request. Throws AuthenticationException when authentication fails.
-            authCtx.reconnect(getControls());
 
             // Check for password policy response control in the response.
             // If present and forced password change is required, throw an exception.
@@ -614,22 +637,23 @@ public class LDAPOperationManager {
             throw new AuthenticationException("Unexpected exception when validating password of user");
         } finally {
             recordLdapRequest("authenticate", success, startTimeNanos, errorName);
-            if (tlsResponse != null) {
+            try {
+                if (tlsResponse != null) {
+                    LDAPStartTlsClose.close(tlsResponse, tlsSocket.get(), tlsTransport.get());
+                }
+            } finally {
                 try {
-                    tlsResponse.close();
-                } catch (IOException e) {
-                    e.printStackTrace();
+                    if (authCtx != null) {
+                        try {
+                            authCtx.close();
+                        } catch (NamingException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                } finally {
+                    tracing.endSpan();
                 }
             }
-
-            if (authCtx != null) {
-                try {
-                    authCtx.close();
-                } catch (NamingException e) {
-                    e.printStackTrace();
-                }
-            }
-            tracing.endSpan();
         }
     }
 

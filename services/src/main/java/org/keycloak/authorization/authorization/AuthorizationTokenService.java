@@ -260,7 +260,13 @@ public class AuthorizationTokenService {
                         throw invalidResponseModeException;
                     }
                 } else {
-                    return createSuccessfulResponse(createAuthorizationResponse(identity, permissions, request, targetClient), request);
+                    try {
+                        return createSuccessfulResponse(createAuthorizationResponse(identity, permissions, request, targetClient), request);
+                    } catch (IllegalArgumentException iae) {
+                        CorsErrorResponseException invalidResponseModeException = new CorsErrorResponseException(request.getCors(), OAuthErrorException.INVALID_REQUEST, iae.getMessage(), Status.BAD_REQUEST);
+                        fireErrorEvent(event, Errors.INVALID_REQUEST, invalidResponseModeException);
+                        throw invalidResponseModeException;
+                    }
                 }
             }
 
@@ -326,6 +332,9 @@ public class AuthorizationTokenService {
         if (accessToken.getSessionState() == null) {
             // Create temporary (request-scoped) transient session
             UserModel user = TokenManager.lookupUserFromStatelessToken(keycloakSession, realm, accessToken);
+            if (user == null) {
+                throw new IllegalArgumentException("User from token not found");
+            }
             userSessionModel = new UserSessionManager(keycloakSession).createUserSession(KeycloakModelUtils.generateId(), realm, user, user.getUsername(), request.getClientConnection().getRemoteHost(),
                     ServiceAccountConstants.CLIENT_AUTH, false, null, null, UserSessionModel.SessionPersistenceState.TRANSIENT);
         } else {
@@ -664,28 +673,48 @@ public class AuthorizationTokenService {
             }
 
             if (!identity.isResourceServer() || !identity.getId().equals(resourceServer.getClientId())) {
+                // resources are only unique per owner, so different owners can have different resources sharing the
+                // same name. Group the granted tickets by their actual resource so that scopes granted by one owner
+                // are never merged into a resource owned by someone else.
                 List<PermissionTicket> tickets = storeFactory.getPermissionTicketStore().findGranted(resourceServer, resourceId, identity.getId());
 
                 if (!tickets.isEmpty()) {
-                    List<Scope> scopes = new ArrayList<>();
-                    Resource grantedResource = null;
+                    Map<Resource, List<Scope>> scopesByResource = new LinkedHashMap<>();
+
                     for (PermissionTicket permissionTicket : tickets) {
-                        if (grantedResource == null) {
-                            grantedResource = permissionTicket.getResource();
-                        }
-                        scopes.add(permissionTicket.getScope());
+                        scopesByResource.computeIfAbsent(permissionTicket.getResource(), r -> new ArrayList<>()).add(permissionTicket.getScope());
                     }
-                    requestedScopesModel.retainAll(scopes);
-                    ResourcePermission resourcePermission = addPermission(request, resourceServer, authorization,
-                            permissionsToEvaluate, limit,
-                            requestedScopesModel, grantedResource);
-                    if (resourcePermission != null) {
-                        Collection<Scope> permissionScopes = resourcePermission.getScopes();
-                        if (permissionScopes != null) {
-                            permissionScopes.retainAll(scopes);
+
+                    for (Entry<Resource, List<Scope>> entry : scopesByResource.entrySet()) {
+                        Resource grantedResource = entry.getKey();
+
+                        if (limit != null && limit.get() <= 0 && !permissionsToEvaluate.containsKey(grantedResource.getId())) {
+                            // limit reached and this resource was not yet added, skip it so we don't exceed the limit
+                            continue;
                         }
-                        // the permission is explicitly granted by the owner, mark this permission as granted so that we don't run the evaluation engine on it
-                        resourcePermission.setGranted(true);
+
+                        List<Scope> scopes = entry.getValue();
+                        Set<Scope> grantedScopesModel = new HashSet<>(requestedScopesModel);
+
+                        grantedScopesModel.retainAll(scopes);
+
+                        if (!requestedScopesModel.isEmpty() && grantedScopesModel.isEmpty()) {
+                            // none of the requested scopes were granted for this resource, skip it so that scopes
+                            // granted for a different resource sharing the same name are not returned instead
+                            continue;
+                        }
+
+                        ResourcePermission resourcePermission = addPermission(request, resourceServer, authorization,
+                                permissionsToEvaluate, limit,
+                                grantedScopesModel, grantedResource);
+                        if (resourcePermission != null) {
+                            Collection<Scope> permissionScopes = resourcePermission.getScopes();
+                            if (permissionScopes != null) {
+                                permissionScopes.retainAll(scopes);
+                            }
+                            // the permission is explicitly granted by the owner, mark this permission as granted so that we don't run the evaluation engine on it
+                            resourcePermission.setGranted(true);
+                        }
                     }
                 }
 
